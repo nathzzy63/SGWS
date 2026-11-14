@@ -1,0 +1,93 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <HX711.h>
+#include <ESP32Servo.h>
+
+
+// GPIO assignments match the schematic.
+constexpr int GAS=4, TRIG=5, ECHO=6, SDA_PIN=9, SCL_PIN=8;
+constexpr int HX_DOUT=16, HX_SCK=17, SERVO_RECYCLE=18, SERVO_ORGANIC=19, SERVO_REJECT=20;
+constexpr int COLOR_OUT=21, COLOR_S1=10, COLOR_S2=11, COLOR_S3=12, COLOR_OE=13, COLOR_S0=15;
+const char *SSID="CirkitWifi", *PASSWORD="";
+constexpr float SCALE_CAL=1.0f; // Calibrate against a known mass before using weight data.
+Adafruit_SSD1306 oled(128,64,&Wire,-1);
+HX711 scale;
+Servo recycleServo, organicServo, rejectServo;
+WebServer server(80);
+float weightG=0, distanceCm=-1;
+bool gasAlarm=false;
+String color="unknown", lastRoute="idle";
+uint32_t lastSample=0, lastDisplay=0;
+
+
+uint32_t colorPulse(bool s2,bool s3){
+  digitalWrite(COLOR_S2,s2); digitalWrite(COLOR_S3,s3); delay(3);
+  return pulseIn(COLOR_OUT,LOW,30000UL);
+}
+String getColor(){
+  // TCS3200: red LL, blue LH, clear HL, green HH. Compare filtered channels only.
+  uint32_t r=colorPulse(LOW,LOW), b=colorPulse(LOW,HIGH), g=colorPulse(HIGH,HIGH);
+  if(!r||!b||!g) return "unknown";
+  if(r<b&&r<g) return "red";
+  if(g<r&&g<b) return "green";
+  if(b<r&&b<g) return "blue";
+  return "unknown";
+}
+float readDistance(){
+  digitalWrite(TRIG,LOW); delayMicroseconds(3); digitalWrite(TRIG,HIGH); delayMicroseconds(10); digitalWrite(TRIG,LOW);
+  unsigned long us=pulseIn(ECHO,HIGH,30000UL);
+  return us ? us*0.0343f/2.0f : -1.0f;
+}
+String json(){
+  return String("{\"weight_g\":")+String(weightG,2)+",\"distance_cm\":"+String(distanceCm,1)+
+    ",\"gas_alarm\":"+(gasAlarm?"true":"false")+",\"color\":\""+color+
+    "\",\"last_route\":\""+lastRoute+"\"}";
+}
+void routeGate(String route){
+  lastRoute=route;
+  Servo *gate=&rejectServo;
+  if(route=="recyclables") gate=&recycleServo;
+  else if(route=="organics") gate=&organicServo;
+  gate->write(90); delay(900); gate->write(0); delay(200);
+}
+void showStatus(){
+  oled.clearDisplay(); oled.setTextColor(SSD1306_WHITE); oled.setTextSize(1); oled.setCursor(0,0);
+  oled.println("SMART SEGREGATION"); oled.print("Weight: "); oled.print(weightG,1); oled.println(" g*");
+  oled.print("Distance: "); oled.print(distanceCm,1); oled.println(" cm"); oled.print("Color: "); oled.println(color);
+  oled.print("Gas alarm: "); oled.println(gasAlarm?"YES":"no"); oled.print("Route: "); oled.println(lastRoute);
+  oled.print("WiFi: "); oled.println(WiFi.status()==WL_CONNECTED?WiFi.localIP().toString():"offline"); oled.println("*calibrate scale"); oled.display();
+}
+void setup(){
+  Serial.begin(115200);
+  pinMode(GAS,INPUT); pinMode(TRIG,OUTPUT); pinMode(ECHO,INPUT); digitalWrite(TRIG,LOW);
+  pinMode(COLOR_OUT,INPUT); pinMode(COLOR_S0,OUTPUT); pinMode(COLOR_S1,OUTPUT);
+  pinMode(COLOR_S2,OUTPUT); pinMode(COLOR_S3,OUTPUT); pinMode(COLOR_OE,OUTPUT);
+  digitalWrite(COLOR_S0,LOW); digitalWrite(COLOR_S1,HIGH); // avoid TCS3200 power-down
+  digitalWrite(COLOR_OE,LOW); // OE active-low
+  Wire.begin(SDA_PIN,SCL_PIN);
+  bool oledOk=oled.begin(SSD1306_SWITCHCAPVCC,0x3C);
+  if(oledOk){oled.clearDisplay(); oled.display();}
+  recycleServo.attach(SERVO_RECYCLE); organicServo.attach(SERVO_ORGANIC); rejectServo.attach(SERVO_REJECT);
+  recycleServo.write(0); organicServo.write(0); rejectServo.write(0);
+  scale.begin(HX_DOUT,HX_SCK); scale.set_scale(SCALE_CAL); if(scale.is_ready()) scale.tare();
+  WiFi.mode(WIFI_STA); WiFi.begin(SSID,PASSWORD);
+  uint32_t start=millis(); while(WiFi.status()!=WL_CONNECTED && millis()-start<15000UL) delay(250);
+  server.on("/",HTTP_GET,[](){server.send(200,"text/html","<meta http-equiv='refresh' content='2'><h2>Smart segregation</h2><pre>"+json()+"</pre>");});
+  server.on("/api/status",HTTP_GET,[](){server.send(200,"application/json",json());}); server.begin();
+  showStatus();
+}
+void loop(){
+  server.handleClient();
+  uint32_t now=millis(); if(now-lastSample<500UL) return; lastSample=now;
+  gasAlarm=(digitalRead(GAS)==HIGH); // Confirm the MQ-5 module's digital-output polarity and threshold.
+  distanceCm=readDistance(); color=getColor(); if(scale.is_ready()) weightG=scale.get_units(3);
+  if(distanceCm>0 && distanceCm<12.0f){
+    if(gasAlarm||color=="unknown"||color=="blue") routeGate("reject");
+    else if(color=="red") routeGate("recyclables");
+    else if(color=="green") routeGate("organics");
+  }
+  if(now-lastDisplay>=1000UL){lastDisplay=now; showStatus(); Serial.println(json());}
+}
